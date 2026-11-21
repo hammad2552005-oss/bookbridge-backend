@@ -11,6 +11,16 @@ import mongoose from 'mongoose';
 import auth from './middleware/auth.js';
 import User from './models/User.js';
 import Book from './models/Book.js';
+import ExchangeRequest from './models/ExchangeRequest.js';
+import {
+  BOOK_CATEGORIES,
+  isValidCategory,
+  toNumberIfPresent,
+  validateBookFields,
+  computeAverageRating,
+  publicBook,
+  publicUser,
+} from './lib/helpers.js';
 
 dotenv.config();
 
@@ -27,6 +37,8 @@ app.use(express.json({ limit: '50mb' }));
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const MONGODB_URI = process.env.MONGODB_URI || '';
+// The user whose email matches ADMIN_EMAIL is the admin (see /api/admin/*).
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').toLowerCase().trim();
 
 if (!process.env.JWT_SECRET) {
   console.warn(
@@ -38,11 +50,12 @@ if (!process.env.JWT_SECRET) {
 // Files ka sahi rasta (Path)
 const USERS_FILE = path.join(__dirname, 'users.json');
 const BOOKS_FILE = path.join(__dirname, 'books.json');
+const REQUESTS_FILE = path.join(__dirname, 'requests.json');
 
 // ---------------------------------------------------------------------------
 // Storage: MongoDB (mongoose) when MONGODB_URI is set, otherwise the
-// existing JSON-file storage (users.json / books.json). The API behaves
-// the same either way.
+// existing JSON-file storage (users.json / books.json / requests.json).
+// The API behaves the same either way.
 // ---------------------------------------------------------------------------
 let useMongo = false;
 
@@ -88,41 +101,28 @@ const writeDB = (f, d) => {
 const isValidEmail = (email) =>
   typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
-const toNumberIfPresent = (value) => {
-  if (value === undefined || value === null || value === '') return undefined;
-  const n = Number(value);
-  return Number.isFinite(n) ? n : NaN;
-};
-
 // A bcrypt hash always starts with $2a$ / $2b$ / $2y$. Anything else stored
 // as a password is a legacy plain-text password from the old JSON data.
 const isBcryptHash = (value) =>
   typeof value === 'string' && /^\$2[aby]\$/.test(value);
 
-// Public view of a user - never send the password hash back.
-const publicUser = (u) => ({
-  id: u.id || u._id,
-  fullName: u.fullName,
-  email: u.email,
-  phone: u.phone,
-});
-
-const publicBook = (b) => ({
-  id: b.id !== undefined ? b.id : b._id,
-  title: b.title,
-  author: b.author,
-  price: b.price,
-  pages: b.pages,
-  description: b.description,
-  owner: b.owner,
-  createdAt: b.createdAt,
-  updatedAt: b.updatedAt,
-});
-
 // --- User store -------------------------------------------------------------
 async function findUserByEmail(email) {
   if (useMongo) return User.findOne({ email });
   return readDB(USERS_FILE).find((u) => u.email === email) || null;
+}
+
+async function getUserById(id) {
+  if (useMongo) {
+    if (!mongoose.Types.ObjectId.isValid(id)) return null;
+    return User.findById(id);
+  }
+  return readDB(USERS_FILE).find((u) => String(u.id) === String(id)) || null;
+}
+
+async function listAllUsers() {
+  if (useMongo) return User.find({});
+  return readDB(USERS_FILE);
 }
 
 async function createUser({ fullName, email, passwordHash, phone }) {
@@ -138,6 +138,7 @@ async function createUser({ fullName, email, passwordHash, phone }) {
     email,
     password: passwordHash,
     phone,
+    wishlist: [],
   };
   users.push(user);
   writeDB(USERS_FILE, users);
@@ -160,6 +161,45 @@ async function migrateLegacyPassword(user, plainPassword) {
   }
 }
 
+// Toggle a book in the user's wishlist. Returns { wishlisted, wishlist }
+// (wishlist is an array of book-id strings), or null if the user is gone.
+async function toggleWishlist(userId, bookId) {
+  if (useMongo) {
+    const user = await User.findById(userId);
+    if (!user) return null;
+    const index = user.wishlist.findIndex(
+      (w) => String(w) === String(bookId)
+    );
+    let wishlisted;
+    if (index === -1) {
+      user.wishlist.push(bookId);
+      wishlisted = true;
+    } else {
+      user.wishlist.splice(index, 1);
+      wishlisted = false;
+    }
+    await user.save();
+    return { wishlisted, wishlist: user.wishlist.map((w) => String(w)) };
+  }
+  const users = readDB(USERS_FILE);
+  const user = users.find((u) => String(u.id) === String(userId));
+  if (!user) return null;
+  if (!Array.isArray(user.wishlist)) user.wishlist = [];
+  const index = user.wishlist.findIndex(
+    (w) => String(w) === String(bookId)
+  );
+  let wishlisted;
+  if (index === -1) {
+    user.wishlist.push(bookId);
+    wishlisted = true;
+  } else {
+    user.wishlist.splice(index, 1);
+    wishlisted = false;
+  }
+  writeDB(USERS_FILE, users);
+  return { wishlisted, wishlist: user.wishlist.map((w) => String(w)) };
+}
+
 // --- Book store -------------------------------------------------------------
 function bookMatchesQuery(book, q) {
   if (!q) return true;
@@ -170,26 +210,80 @@ function bookMatchesQuery(book, q) {
   );
 }
 
-async function listBooks({ q, page, limit }) {
+function bookMatchesCategory(book, category) {
+  if (!category) return true;
+  return book.category === category;
+}
+
+// Sorting for JSON-file mode, and for the `rating` sort in Mongo mode
+// (the average rating is computed from the embedded reviews, so it is
+// sorted in JS). `sort` is one of newest | price-asc | price-desc | rating.
+function sortBooks(books, sort) {
+  const sorted = [...books];
+  const stamp = (b) =>
+    b.createdAt ? new Date(b.createdAt).getTime() : Number(b.id) || 0;
+  switch (sort) {
+    case 'price-asc':
+      sorted.sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
+      break;
+    case 'price-desc':
+      sorted.sort((a, b) => (b.price ?? -Infinity) - (a.price ?? -Infinity));
+      break;
+    case 'rating':
+      sorted.sort(
+        (a, b) =>
+          computeAverageRating(b.reviews).averageRating -
+            computeAverageRating(a.reviews).averageRating ||
+          stamp(b) - stamp(a)
+      );
+      break;
+    case 'newest':
+    default:
+      sorted.sort((a, b) => stamp(b) - stamp(a));
+      break;
+  }
+  return sorted;
+}
+
+async function listBooks({ q, category, sort = 'newest', page, limit }) {
   if (useMongo) {
-    const filter = q
-      ? {
-          $or: [
-            { title: { $regex: q, $options: 'i' } },
-            { author: { $regex: q, $options: 'i' } },
-          ],
-        }
-      : {};
+    const filter = {};
+    if (q) {
+      filter.$or = [
+        { title: { $regex: q, $options: 'i' } },
+        { author: { $regex: q, $options: 'i' } },
+      ];
+    }
+    if (category) filter.category = category;
+
+    if (sort === 'rating') {
+      // Average rating is computed from the embedded reviews, so sort in JS.
+      const all = await Book.find(filter);
+      const sorted = sortBooks(all, 'rating');
+      const total = sorted.length;
+      const books = sorted.slice((page - 1) * limit, page * limit);
+      return { books: books.map(publicBook), total };
+    }
+
+    const mongoSort =
+      sort === 'price-asc'
+        ? { price: 1 }
+        : sort === 'price-desc'
+          ? { price: -1 }
+          : { createdAt: -1 };
     const total = await Book.countDocuments(filter);
     const books = await Book.find(filter)
-      .sort({ createdAt: -1 })
+      .sort(mongoSort)
       .skip((page - 1) * limit)
       .limit(limit);
     return { books: books.map(publicBook), total };
   }
-  const all = readDB(BOOKS_FILE).filter((b) => bookMatchesQuery(b, q));
-  const total = all.length;
-  const books = all.slice((page - 1) * limit, page * limit);
+  const filtered = readDB(BOOKS_FILE)
+    .filter((b) => bookMatchesQuery(b, q))
+    .filter((b) => bookMatchesCategory(b, category));
+  const sorted = sortBooks(filtered, sort);
+  const total = sorted.length;
+  const books = sorted.slice((page - 1) * limit, page * limit);
   return { books: books.map(publicBook), total };
 }
 
@@ -203,13 +297,30 @@ async function getBookById(id) {
   return readDB(BOOKS_FILE).find((b) => b.id === numId) || null;
 }
 
-async function addBook({ title, author, price, pages, description, owner }) {
+async function addBook({
+  title,
+  author,
+  price,
+  pages,
+  description,
+  category,
+  owner,
+}) {
   if (useMongo) {
-    const book = new Book({ title, author, price, pages, description, owner });
+    const book = new Book({
+      title,
+      author,
+      price,
+      pages,
+      description,
+      category,
+      owner,
+    });
     await book.save();
     return book;
   }
   const books = readDB(BOOKS_FILE);
+  const now = new Date().toISOString();
   const book = {
     id: Date.now(),
     title,
@@ -217,7 +328,11 @@ async function addBook({ title, author, price, pages, description, owner }) {
     price,
     pages,
     description,
+    category: category || 'Other',
+    reviews: [],
     owner,
+    createdAt: now,
+    updatedAt: now,
   };
   books.push(book);
   writeDB(BOOKS_FILE, books);
@@ -234,7 +349,7 @@ async function updateBook(id, fields) {
   const books = readDB(BOOKS_FILE);
   const book = books.find((b) => b.id === numId);
   if (!book) return null;
-  Object.assign(book, fields);
+  Object.assign(book, fields, { updatedAt: new Date().toISOString() });
   writeDB(BOOKS_FILE, books);
   return book;
 }
@@ -254,29 +369,194 @@ async function deleteBook(id) {
   return removed;
 }
 
-// Validate book fields. Returns an error message string, or null if OK.
-// `partial` = true for PUT (only validate the fields that were sent).
-function validateBookFields(body, partial = false) {
-  if (!partial || body.title !== undefined) {
-    if (!body.title || typeof body.title !== 'string' || !body.title.trim()) {
-      return 'title is required';
+// --- Reviews (stored inside the book record) -------------------------------
+function publicReview(r) {
+  return {
+    user: r.user !== undefined ? String(r.user) : r.userId,
+    rating: r.rating,
+    text: r.text || '',
+    createdAt: r.createdAt,
+  };
+}
+
+// Add a review, or update the same user's existing review on this book.
+// Returns { book, created } or null when the book does not exist.
+async function addOrUpdateReview(bookId, userId, rating, text) {
+  const book = await getBookById(bookId);
+  if (!book) return null;
+  if (useMongo) {
+    const existing = book.reviews.find(
+      (r) => String(r.user) === String(userId)
+    );
+    let created = false;
+    if (existing) {
+      existing.rating = rating;
+      existing.text = text;
+    } else {
+      book.reviews.push({ user: userId, rating, text });
+      created = true;
     }
+    await book.save();
+    return { book, created };
   }
-  const price = toNumberIfPresent(body.price);
-  if (body.price !== undefined && body.price !== '' && Number.isNaN(price)) {
-    return 'price must be a number';
+  if (!Array.isArray(book.reviews)) book.reviews = [];
+  const existing = book.reviews.find(
+    (r) => String(r.userId) === String(userId)
+  );
+  let created = false;
+  if (existing) {
+    existing.rating = rating;
+    existing.text = text;
+  } else {
+    book.reviews.push({
+      userId,
+      rating,
+      text,
+      createdAt: new Date().toISOString(),
+    });
+    created = true;
   }
-  if (price !== undefined && price < 0) {
-    return 'price must be zero or more';
+  const books = readDB(BOOKS_FILE);
+  const index = books.findIndex((b) => b.id === book.id);
+  if (index !== -1) {
+    books[index] = book;
+    writeDB(BOOKS_FILE, books);
   }
-  const pages = toNumberIfPresent(body.pages);
-  if (body.pages !== undefined && body.pages !== '' && Number.isNaN(pages)) {
-    return 'pages must be a number';
+  return { book, created };
+}
+
+// --- Exchange / borrow requests --------------------------------------------
+const REQUEST_STATUSES = ['pending', 'approved', 'rejected'];
+
+function publicRequest(r, book) {
+  return {
+    id: r.id !== undefined ? r.id : r._id,
+    book: book
+      ? {
+          id: book.id !== undefined ? book.id : book._id,
+          title: book.title,
+          author: book.author,
+        }
+      : { id: r.book !== undefined ? r.book : r.bookId },
+    requester: r.requester,
+    owner: r.owner,
+    status: r.status,
+    message: r.message,
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt,
+  };
+}
+
+async function createExchangeRequest({ bookId, requester, owner, message }) {
+  if (useMongo) {
+    const reqDoc = new ExchangeRequest({
+      book: bookId,
+      requester,
+      owner,
+      message,
+    });
+    await reqDoc.save();
+    return reqDoc;
   }
-  if (pages !== undefined && pages < 1) {
-    return 'pages must be at least 1';
+  const requests = readDB(REQUESTS_FILE);
+  const now = new Date().toISOString();
+  const reqDoc = {
+    id: Date.now(),
+    bookId,
+    requester,
+    owner,
+    status: 'pending',
+    message: message || '',
+    createdAt: now,
+    updatedAt: now,
+  };
+  requests.push(reqDoc);
+  writeDB(REQUESTS_FILE, requests);
+  return reqDoc;
+}
+
+async function getRequestById(id) {
+  if (useMongo) {
+    if (!mongoose.Types.ObjectId.isValid(id)) return null;
+    return ExchangeRequest.findById(id);
   }
-  return null;
+  const numId = Number(id);
+  if (!Number.isFinite(numId)) return null;
+  return readDB(REQUESTS_FILE).find((r) => r.id === numId) || null;
+}
+
+async function listRequestsForUser(userId) {
+  if (useMongo) {
+    return ExchangeRequest.find({
+      $or: [{ requester: userId }, { owner: userId }],
+    }).sort({ createdAt: -1 });
+  }
+  return readDB(REQUESTS_FILE)
+    .filter(
+      (r) =>
+        String(r.requester) === String(userId) ||
+        String(r.owner) === String(userId)
+    )
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+}
+
+async function findPendingRequest(bookId, requester) {
+  if (useMongo) {
+    return ExchangeRequest.findOne({
+      book: bookId,
+      requester,
+      status: 'pending',
+    });
+  }
+  return (
+    readDB(REQUESTS_FILE).find(
+      (r) =>
+        String(r.bookId) === String(bookId) &&
+        String(r.requester) === String(requester) &&
+        r.status === 'pending'
+    ) || null
+  );
+}
+
+async function updateRequestStatus(id, status) {
+  if (useMongo) {
+    if (!mongoose.Types.ObjectId.isValid(id)) return null;
+    return ExchangeRequest.findByIdAndUpdate(id, { status }, { new: true });
+  }
+  const numId = Number(id);
+  if (!Number.isFinite(numId)) return null;
+  const requests = readDB(REQUESTS_FILE);
+  const reqDoc = requests.find((r) => r.id === numId);
+  if (!reqDoc) return null;
+  reqDoc.status = status;
+  reqDoc.updatedAt = new Date().toISOString();
+  writeDB(REQUESTS_FILE, requests);
+  return reqDoc;
+}
+
+// Attach a small book summary to each request (same shape, both storages).
+async function withBookSummary(requests) {
+  const out = [];
+  for (const r of requests) {
+    const bookId = r.book !== undefined ? r.book : r.bookId;
+    const book = await getBookById(String(bookId));
+    out.push(publicRequest(r, book));
+  }
+  return out;
+}
+
+// --- Admin ------------------------------------------------------------------
+const isAdmin = (req) =>
+  Boolean(ADMIN_EMAIL) &&
+  req.user &&
+  typeof req.user.email === 'string' &&
+  req.user.email.toLowerCase() === ADMIN_EMAIL;
+
+function adminOnly(req, res, next) {
+  if (!isAdmin(req)) {
+    return res.status(403).json({ msg: 'Admin access required' });
+  }
+  return next();
 }
 
 // ---------------------------------------------------------------------------
@@ -370,28 +650,62 @@ app.post('/api/auth/login', async (req, res) => {
 // ---------------------------------------------------------------------------
 // Book routes
 // ---------------------------------------------------------------------------
-// GET /api/books?q=search&page=1&limit=10
+// GET /api/books?q=&category=&sort=&page=&limit=
 // Without query params it returns the plain books array (old behaviour).
-// With ?q=, ?page= or ?limit= it returns { books, page, limit, total, totalPages }.
+// With ?q=, ?category=, ?sort=, ?page= or ?limit= it returns
+// { books, page, limit, total, totalPages }.
+// sort: newest | price-asc | price-desc | rating (default: newest)
 app.get('/api/books', async (req, res) => {
   try {
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const category =
+      typeof req.query.category === 'string'
+        ? req.query.category.trim()
+        : '';
+    const sort =
+      typeof req.query.sort === 'string' ? req.query.sort.trim() : 'newest';
+
+    if (category && !isValidCategory(category)) {
+      return res.status(400).json({
+        msg: `category must be one of: ${BOOK_CATEGORIES.join(', ')}`,
+      });
+    }
+    if (!['newest', 'price-asc', 'price-desc', 'rating'].includes(sort)) {
+      return res.status(400).json({
+        msg: 'sort must be one of: newest, price-asc, price-desc, rating',
+      });
+    }
+
     const usePaging =
       req.query.q !== undefined ||
       req.query.page !== undefined ||
-      req.query.limit !== undefined;
+      req.query.limit !== undefined ||
+      req.query.category !== undefined ||
+      req.query.sort !== undefined;
 
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.min(
       100,
       Math.max(1, parseInt(req.query.limit, 10) || 10)
     );
-    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
 
-    const { books, total } = await listBooks({ q, page, limit });
+    const { books, total } = await listBooks({
+      q,
+      category: category || undefined,
+      sort,
+      page,
+      limit,
+    });
 
     if (!usePaging) {
       // Old behaviour: return every book as a plain array.
-      const all = await listBooks({ q: '', page: 1, limit: total || 1000 });
+      const all = await listBooks({
+        q: '',
+        category: undefined,
+        sort,
+        page: 1,
+        limit: total || 1000,
+      });
       return res.json(all.books);
     }
 
@@ -421,6 +735,9 @@ app.post('/api/books/add', auth, async (req, res) => {
       description: req.body.description
         ? String(req.body.description).trim()
         : undefined,
+      category: req.body.category
+        ? String(req.body.category).trim()
+        : undefined,
       owner: req.user.id,
     });
 
@@ -444,6 +761,9 @@ app.put('/api/books/:id', auth, async (req, res) => {
     if (req.body.description !== undefined) {
       fields.description = String(req.body.description).trim();
     }
+    if (req.body.category !== undefined) {
+      fields.category = String(req.body.category).trim();
+    }
 
     const book = await updateBook(req.params.id, fields);
     if (!book) return res.status(404).json({ msg: 'Book not found' });
@@ -462,6 +782,195 @@ app.delete('/api/books/:id', auth, async (req, res) => {
   } catch (err) {
     console.error('Delete book error:', err);
     return res.status(500).json({ msg: 'Delete error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Review routes
+// ---------------------------------------------------------------------------
+app.get('/api/books/:id/reviews', async (req, res) => {
+  try {
+    const book = await getBookById(req.params.id);
+    if (!book) return res.status(404).json({ msg: 'Book not found' });
+    const reviews = (book.reviews || []).map(publicReview);
+    const { averageRating, reviewCount } = computeAverageRating(
+      book.reviews
+    );
+    return res.json({
+      book: publicBook(book),
+      reviews,
+      averageRating,
+      reviewCount,
+    });
+  } catch (err) {
+    console.error('List reviews error:', err);
+    return res.status(500).json({ msg: 'Could not list reviews' });
+  }
+});
+
+app.post('/api/books/:id/reviews', auth, async (req, res) => {
+  try {
+    const book = await getBookById(req.params.id);
+    if (!book) return res.status(404).json({ msg: 'Book not found' });
+
+    const rating = Number(req.body?.rating);
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res
+        .status(400)
+        .json({ msg: 'rating must be an integer between 1 and 5' });
+    }
+    const text = req.body?.text ? String(req.body.text).trim() : '';
+    if (text.length > 1000) {
+      return res
+        .status(400)
+        .json({ msg: 'review text must be at most 1000 characters' });
+    }
+
+    const result = await addOrUpdateReview(
+      req.params.id,
+      req.user.id,
+      rating,
+      text
+    );
+    const { averageRating, reviewCount } = computeAverageRating(
+      result.book.reviews
+    );
+    return res.status(result.created ? 201 : 200).json({
+      msg: 'Review saved',
+      book: publicBook(result.book),
+      averageRating,
+      reviewCount,
+    });
+  } catch (err) {
+    console.error('Add review error:', err);
+    return res.status(500).json({ msg: 'Could not save review' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Exchange / borrow request routes
+// ---------------------------------------------------------------------------
+app.post('/api/books/:id/request', auth, async (req, res) => {
+  try {
+    const book = await getBookById(req.params.id);
+    if (!book) return res.status(404).json({ msg: 'Book not found' });
+    if (book.owner && String(book.owner) === String(req.user.id)) {
+      return res
+        .status(400)
+        .json({ msg: 'You cannot request your own book' });
+    }
+    const existing = await findPendingRequest(req.params.id, req.user.id);
+    if (existing) {
+      return res.status(400).json({
+        msg: 'You already have a pending request for this book',
+      });
+    }
+    const message = req.body?.message ? String(req.body.message).trim() : '';
+    if (message.length > 500) {
+      return res
+        .status(400)
+        .json({ msg: 'message must be at most 500 characters' });
+    }
+    const request = await createExchangeRequest({
+      bookId: req.params.id,
+      requester: req.user.id,
+      owner: book.owner,
+      message,
+    });
+    const [withBook] = await withBookSummary([request]);
+    return res.status(201).json({ msg: 'Request created', request: withBook });
+  } catch (err) {
+    console.error('Create request error:', err);
+    return res.status(500).json({ msg: 'Could not create request' });
+  }
+});
+
+app.get('/api/requests', auth, async (req, res) => {
+  try {
+    const requests = await listRequestsForUser(req.user.id);
+    const out = await withBookSummary(requests);
+    return res.json(out);
+  } catch (err) {
+    console.error('List requests error:', err);
+    return res.status(500).json({ msg: 'Could not list requests' });
+  }
+});
+
+app.put('/api/requests/:id', auth, async (req, res) => {
+  try {
+    const status = req.body?.status;
+    if (status !== 'approved' && status !== 'rejected') {
+      return res
+        .status(400)
+        .json({ msg: "status must be 'approved' or 'rejected'" });
+    }
+    const request = await getRequestById(req.params.id);
+    if (!request) return res.status(404).json({ msg: 'Request not found' });
+    if (!request.owner || String(request.owner) !== String(req.user.id)) {
+      return res.status(403).json({
+        msg: 'Only the book owner can approve or reject requests',
+      });
+    }
+    if (request.status !== 'pending') {
+      return res.status(400).json({ msg: 'Request is no longer pending' });
+    }
+    const updated = await updateRequestStatus(req.params.id, status);
+    const [withBook] = await withBookSummary([updated]);
+    return res.json({ msg: 'Success', request: withBook });
+  } catch (err) {
+    console.error('Update request error:', err);
+    return res.status(500).json({ msg: 'Could not update request' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Wishlist routes
+// ---------------------------------------------------------------------------
+app.post('/api/books/:id/wishlist', auth, async (req, res) => {
+  try {
+    const book = await getBookById(req.params.id);
+    if (!book) return res.status(404).json({ msg: 'Book not found' });
+    const bookId = book.id !== undefined ? book.id : book._id;
+    const result = await toggleWishlist(req.user.id, bookId);
+    if (!result) return res.status(404).json({ msg: 'User not found' });
+    return res.json({
+      msg: result.wishlisted ? 'Added to wishlist' : 'Removed from wishlist',
+      wishlisted: result.wishlisted,
+      wishlist: result.wishlist,
+    });
+  } catch (err) {
+    console.error('Wishlist error:', err);
+    return res.status(500).json({ msg: 'Could not update wishlist' });
+  }
+});
+
+app.get('/api/users/me/wishlist', auth, async (req, res) => {
+  try {
+    const user = await getUserById(req.user.id);
+    if (!user) return res.status(404).json({ msg: 'User not found' });
+    const books = [];
+    for (const id of user.wishlist || []) {
+      const book = await getBookById(String(id));
+      if (book) books.push(publicBook(book));
+    }
+    return res.json(books);
+  } catch (err) {
+    console.error('Wishlist list error:', err);
+    return res.status(500).json({ msg: 'Could not list wishlist' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Admin routes
+// ---------------------------------------------------------------------------
+app.get('/api/admin/users', auth, adminOnly, async (req, res) => {
+  try {
+    const users = await listAllUsers();
+    // publicUser strips the password hash - it is never sent back.
+    return res.json(users.map(publicUser));
+  } catch (err) {
+    console.error('Admin list users error:', err);
+    return res.status(500).json({ msg: 'Could not list users' });
   }
 });
 

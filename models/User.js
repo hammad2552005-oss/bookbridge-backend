@@ -13,6 +13,11 @@ const userSchema = new mongoose.Schema(
     // Stored as a bcrypt hash. Never store a plain-text password.
     password: { type: String, required: true },
     phone: { type: String, trim: true },
+    // Books the user saved for later (array of Book ids).
+    wishlist: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Book' }],
+      default: [],
+    },
   },
   { timestamps: true }
 );

@@ -1,12 +1,4 @@
 {
-  "name": "backend",
-  "version": "1.1.0",
-  "main": "server.js",
-  "type": "module",
-  "scripts": {
-    "dev": "nodemon server.js",
-    "start": "node server.js"
-  },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.6",
@@ -15,5 +7,14 @@
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.23.1",
     "nodemon": "^3.1.14"
-  }
+  },
+  "main": "server.js",
+  "name": "backend",
+  "scripts": {
+    "dev": "nodemon server.js",
+    "start": "node server.js",
+    "test": "node --test tests/helpers.test.js tests/auth.test.js"
+  },
+  "type": "module",
+  "version": "1.2.0"
 }
